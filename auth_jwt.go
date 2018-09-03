@@ -41,6 +41,10 @@ type GinJWTMiddleware struct {
 	// Optional, defaults to 0 meaning not refreshable.
 	MaxRefresh time.Duration
 
+	// This field is to allow to refresh the token automatically when it is about to expire, i.e. at timestamp == Timeout
+	// Only works if TokenLookup contains "cookie:<name>".
+	AutoRefresh bool
+
 	// Callback function that should perform the authentication of the user based on login info.
 	// Must return user data as user identifier, it will be stored in Claim Array. Required.
 	// Check error (e) to determine the appropriate error message.
@@ -324,11 +328,63 @@ func (mw *GinJWTMiddleware) MiddlewareFunc() gin.HandlerFunc {
 }
 
 func (mw *GinJWTMiddleware) middlewareImpl(c *gin.Context) {
-	token, err := mw.parseToken(c)
+	var (
+		token *jwt.Token
+		err   error
+	)
 
-	if err != nil {
+	token, err = mw.parseToken(c)
+
+	if token == nil {
 		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
 		return
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+
+	if err != nil {
+		if ve, ok := err.(*jwt.ValidationError); mw.AutoRefresh && ok && (ve.Errors&jwt.ValidationErrorExpired != 0) {
+			// Token is expired, but cookie and autorefresh are enabled, so auto refresh the token now!
+			// Create a new one
+			token = jwt.New(jwt.GetSigningMethod(mw.SigningAlgorithm))
+			newClaims := token.Claims.(jwt.MapClaims)
+
+			for key := range claims {
+				newClaims[key] = claims[key]
+			}
+
+			expire := mw.TimeFunc().Add(mw.Timeout)
+			newClaims["exp"] = expire.Unix()
+			newClaims["orig_iat"] = mw.TimeFunc().Unix()
+			tokenString, err := mw.signedString(token)
+
+			if err != nil {
+				mw.Unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrFailedTokenCreation, c))
+				return
+			}
+
+			// find the cookie name and update the cookie parts[1]!
+			methods := strings.Split(mw.TokenLookup, ",")
+			for _, method := range methods {
+				parts := strings.Split(strings.TrimSpace(method), ":")
+				k := strings.TrimSpace(parts[0])
+				v := strings.TrimSpace(parts[1])
+				if k == "cookie" {
+					maxage := int(expire.Unix() - time.Now().Unix())
+					c.SetCookie(v, tokenString, maxage, "/", "", true, true)
+					break
+				}
+			}
+
+			// save token string
+			c.Set("JWT_TOKEN", token)
+
+			claims = newClaims
+
+		} else {
+			mw.Unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(err, c))
+			return
+		}
 	}
 
 	if mw.SendAuthorization {
@@ -337,7 +393,7 @@ func (mw *GinJWTMiddleware) middlewareImpl(c *gin.Context) {
 		}
 	}
 
-	claims := token.Claims.(jwt.MapClaims)
+	//claims := token.Claims.(jwt.MapClaims)
 	c.Set("JWT_PAYLOAD", claims)
 	identity := mw.IdentityHandler(c)
 
@@ -514,13 +570,13 @@ func (mw *GinJWTMiddleware) jwtFromQuery(c *gin.Context, key string) (string, er
 }
 
 func (mw *GinJWTMiddleware) jwtFromCookie(c *gin.Context, key string) (string, error) {
-	cookie, _ := c.Cookie(key)
+	cookie, err := c.Cookie(key)
 
 	if cookie == "" {
 		return "", ErrEmptyCookieToken
 	}
 
-	return cookie, nil
+	return cookie, err
 }
 
 func (mw *GinJWTMiddleware) parseToken(c *gin.Context) (*jwt.Token, error) {
