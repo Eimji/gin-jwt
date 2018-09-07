@@ -375,6 +375,8 @@ func (mw *GinJWTMiddleware) middlewareImpl(c *gin.Context) {
 					break
 				}
 			}
+			// Add the new token in the response header
+			c.Writer.Header().Set("x-auth-token", tokenString)
 
 			// save token string
 			c.Set("JWT_TOKEN", token)
