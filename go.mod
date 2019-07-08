@@ -1,4 +1,4 @@
-module github.com/appleboy/gin-jwt
+module github.com/eimji/gin-jwt
 
 go 1.12
 
